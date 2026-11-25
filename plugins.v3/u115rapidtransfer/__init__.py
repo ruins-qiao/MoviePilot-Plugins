@@ -97,7 +97,7 @@ class U115RapidTransfer(_PluginBase):
     plugin_icon = "https://raw.githubusercontent.com/ruins-qiao/MoviePilot-Plugins/main/icons/U115RapidTransfer.png"
     plugin_version = "1.1.2"
     plugin_author = "qiaoba"
-    author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
+    author_url = "https://github.com/ruins-qiao/MoviePilot-Plugins"
     plugin_config_prefix = "u115rapidtransfer_"
     plugin_order = 50
     auth_level = 1
