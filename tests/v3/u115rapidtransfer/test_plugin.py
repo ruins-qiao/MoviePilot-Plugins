@@ -298,8 +298,8 @@ def test_form_page_and_api_responses(plugin):
     assert status_resp.success is True
     assert status_resp.data.enabled is True
     assert plugin.plugin_name == "115秒传助手"
-    assert plugin.plugin_icon == "U115RapidTransfer.png"
-    assert plugin.plugin_version == "1.1.0"
+    assert plugin.plugin_icon == "https://raw.githubusercontent.com/ruins-qiao/MoviePilot-Plugins/main/icons/U115RapidTransfer.png"
+    assert plugin.plugin_version == "1.1.1"
 
 
 def test_calc_file_digests_and_stop_interrupt(tmp_path):
