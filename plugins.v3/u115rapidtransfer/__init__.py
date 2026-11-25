@@ -92,10 +92,10 @@ class RapidTransferActionData(BaseModel):
 class U115RapidTransfer(_PluginBase):
     """在整理文件到 115 网盘时强制只走秒传，秒传失败后按指定间隔自动重试。"""
 
-    plugin_name = "115只秒传重试"
+    plugin_name = "115秒传助手"
     plugin_desc = "整理文件到115网盘时仅允许秒传（禁止普通上传），秒传失败后等待指定时间自动重试。"
-    plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.0"
+    plugin_icon = "U115RapidTransfer.png"
+    plugin_version = "1.1.0"
     plugin_author = "qiaoba"
     author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
     plugin_config_prefix = "u115rapidtransfer_"
@@ -116,6 +116,8 @@ class U115RapidTransfer(_PluginBase):
         self._cron = _DEFAULT_CRON
         self._rapid_failed_items: dict[str, dict[str, Any]] = {}
         self._scheduled_job_ids: set[str] = set()
+        self._in_flight_retries: set[str] = set()
+        self._last_scan_at: Optional[float] = None
 
     @staticmethod
     def _coerce_non_negative_int(value: Any, default: int, minimum: int = 0) -> int:
@@ -134,7 +136,7 @@ class U115RapidTransfer(_PluginBase):
             CronTrigger.from_crontab(text)
             return text
         except ValueError:
-            logger.warning(f"【115只秒传】无效的 Cron 表达式 {text!r}，已回退为 {_DEFAULT_CRON}")
+            logger.warning(f"【115秒传助手】无效的 Cron 表达式 {text!r}，已回退为 {_DEFAULT_CRON}")
             return _DEFAULT_CRON
 
     @staticmethod
@@ -143,20 +145,22 @@ class U115RapidTransfer(_PluginBase):
         digest = hashlib.sha1(norm_path.encode("utf-8")).hexdigest()[:16]
         return f"retry_{digest}"
 
-    def _cancel_all_once_jobs(self) -> None:
-        """取消当前插件登记的所有待执行一次性重试任务。"""
+    def _cancel_all_once_jobs(self) -> int:
+        """取消当前插件登记的所有待执行一次性重试任务，返回清理的调度任务数。"""
         remove_job = getattr(scheduler_sdk, "remove_plugin_once_job", None)
         with self._lock:
             job_ids = list(self._scheduled_job_ids)
             self._scheduled_job_ids.clear()
         if not callable(remove_job):
-            return
+            return 0
         plugin_id = self.__class__.__name__
-        for job_id in [*job_ids, "scan_pending_once"]:
+        all_ids = [*job_ids, "scan_pending_once"]
+        for job_id in all_ids:
             try:
                 remove_job(plugin_id, job_id)
             except Exception as err:
-                logger.debug(f"【115只秒传】取消调度任务 {job_id} 忽略异常：{err}")
+                logger.debug(f"【115秒传助手】取消调度任务 {job_id} 忽略异常：{err}")
+        return len(job_ids)
 
     def _schedule_once_job(
         self,
@@ -183,7 +187,7 @@ class U115RapidTransfer(_PluginBase):
                 )
             )
         except Exception as err:
-            logger.warning(f"【115只秒传】注册一次性任务 {job_id} 失败：{err}")
+            logger.warning(f"【115秒传助手】注册一次性任务 {job_id} 失败：{err}")
             return False
         if scheduled:
             with self._lock:
@@ -206,11 +210,19 @@ class U115RapidTransfer(_PluginBase):
 
         with self._lock:
             self._rapid_failed_items.clear()
+            self._in_flight_retries.clear()
 
         if not self._enabled:
+            logger.info("【115秒传助手】插件未启用")
             return
 
-        self._reschedule_persisted_retries()
+        restored_count = self._reschedule_persisted_retries()
+        logger.info(
+            "【115秒传助手】插件已启用："
+            f"only_media={self._only_media}, min_size_mb={self._min_size_mb}, "
+            f"retry_delay={self._retry_delay}s, max_retries={self._max_retries}, "
+            f"cron='{self._cron}', restored_pending={restored_count}"
+        )
 
         if cfg.get("onlyonce"):
             cfg["onlyonce"] = False
@@ -218,9 +230,10 @@ class U115RapidTransfer(_PluginBase):
             self._schedule_once_job(
                 "scan_pending_once",
                 self.check_pending_retries,
-                "115只秒传立即巡检待重试队列",
+                "115秒传助手立即巡检待重试队列",
                 delay_seconds=3,
             )
+            logger.info("【115秒传助手】已登记立即巡检待重试队列任务（3 秒后执行）")
 
     def get_state(self) -> bool:
         """返回插件当前是否启用。"""
@@ -248,7 +261,7 @@ class U115RapidTransfer(_PluginBase):
                 "methods": ["GET"],
                 "auth": "bear",
                 "response_model": Response[RapidTransferStatusData],
-                "summary": "获取115只秒传重试状态",
+                "summary": "获取115秒传助手运行状态",
             },
             {
                 "path": "/retry",
@@ -266,6 +279,14 @@ class U115RapidTransfer(_PluginBase):
                 "response_model": Response[RapidTransferActionData],
                 "summary": "清理115待重试队列",
             },
+            {
+                "path": "/clear_records",
+                "endpoint": self.api_clear_records,
+                "methods": ["POST"],
+                "auth": "bear",
+                "response_model": Response[RapidTransferActionData],
+                "summary": "清空最近处理记录",
+            },
         ]
 
     def get_service(self) -> list[dict[str, Any]]:
@@ -279,7 +300,7 @@ class U115RapidTransfer(_PluginBase):
         return [
             {
                 "id": f"{self.__class__.__name__}.CheckPendingRetries",
-                "name": "115只秒传待重试队列巡检",
+                "name": "115秒传助手待重试队列巡检",
                 "trigger": trigger,
                 "func": self.check_pending_retries,
                 "kwargs": {},
@@ -465,17 +486,19 @@ class U115RapidTransfer(_PluginBase):
         }
 
     def get_page(self) -> list[dict[str, Any]]:
-        """返回插件详情页，展示待重试队列与最近秒传记录。"""
+        """返回插件详情页，展示待重试队列、交互操作按钮与最近秒传记录。"""
         pending = self._load_pending_retries()
         records = self._load_records()
         stats = self._load_stats()
+        plugin_id = self.__class__.__name__
 
         summary_text = (
             f"状态：{'运行中' if self._enabled else '已停用'} | "
             f"等待重试：{len(pending)} 项 | "
             f"秒传成功：{stats.get('rapid_success', 0)} | "
             f"拦截普通上传：{stats.get('rapid_blocked', 0)} | "
-            f"重试耗尽：{stats.get('retry_exhausted', 0)}"
+            f"重试耗尽：{stats.get('retry_exhausted', 0)} | "
+            f"最近巡检：{_format_ts(self._last_scan_at)}"
         )
 
         contents: list[dict[str, Any]] = [
@@ -487,23 +510,123 @@ class U115RapidTransfer(_PluginBase):
                     "text": summary_text,
                     "class": "mb-4",
                 },
-            }
+            },
+            {
+                "component": "div",
+                "props": {"class": "d-flex flex-wrap ga-2 mb-4"},
+                "content": [
+                    {
+                        "component": "VBtn",
+                        "props": {
+                            "color": "primary",
+                            "variant": "tonal",
+                            "size": "small",
+                            "disabled": not (self._enabled and pending),
+                        },
+                        "text": "立即全部重试",
+                        "events": {
+                            "click": {
+                                "api": f"plugin/{plugin_id}/retry",
+                                "method": "post",
+                            }
+                        },
+                    },
+                    {
+                        "component": "VBtn",
+                        "props": {
+                            "color": "error",
+                            "variant": "tonal",
+                            "size": "small",
+                            "disabled": not pending,
+                        },
+                        "text": "清空等待队列",
+                        "events": {
+                            "click": {
+                                "api": f"plugin/{plugin_id}/clear",
+                                "method": "post",
+                            }
+                        },
+                    },
+                    {
+                        "component": "VBtn",
+                        "props": {
+                            "color": "secondary",
+                            "variant": "tonal",
+                            "size": "small",
+                            "disabled": not records,
+                        },
+                        "text": "清空处理记录",
+                        "events": {
+                            "click": {
+                                "api": f"plugin/{plugin_id}/clear_records",
+                                "method": "post",
+                            }
+                        },
+                    },
+                ],
+            },
         ]
 
         if pending:
             pending_rows = []
             for item in sorted(pending.values(), key=lambda x: x.get("next_retry_at", 0)):
+                src_path = str(item.get("src_path") or "")
                 pending_rows.append(
                     {
                         "component": "tr",
                         "content": [
-                            {"component": "td", "text": Path(item.get("src_path", "")).name or "-"},
+                            {"component": "td", "text": Path(src_path).name or "-"},
                             {
                                 "component": "td",
                                 "text": f"{item.get('attempt', 0)} / {item.get('max_retries', self._max_retries)}",
                             },
                             {"component": "td", "text": _format_ts(item.get("next_retry_at"))},
                             {"component": "td", "text": str(item.get("last_error") or "-")},
+                            {
+                                "component": "td",
+                                "content": [
+                                    {
+                                        "component": "div",
+                                        "props": {"class": "d-flex ga-2"},
+                                        "content": [
+                                            {
+                                                "component": "VBtn",
+                                                "props": {
+                                                    "color": "primary",
+                                                    "variant": "text",
+                                                    "size": "x-small",
+                                                    "disabled": not self._enabled or not src_path,
+                                                },
+                                                "text": "重试",
+                                                "events": {
+                                                    "click": {
+                                                        "api": f"plugin/{plugin_id}/retry",
+                                                        "method": "post",
+                                                        "params": {"src_path": src_path},
+                                                    }
+                                                },
+                                            },
+                                            {
+                                                "component": "VBtn",
+                                                "props": {
+                                                    "color": "error",
+                                                    "variant": "text",
+                                                    "size": "x-small",
+                                                    "disabled": not src_path,
+                                                },
+                                                "text": "移除",
+                                                "events": {
+                                                    "click": {
+                                                        "api": f"plugin/{plugin_id}/clear",
+                                                        "method": "post",
+                                                        "params": {"src_path": src_path},
+                                                    }
+                                                },
+                                            },
+                                        ],
+                                    }
+                                ],
+                            },
                         ],
                     }
                 )
@@ -527,6 +650,7 @@ class U115RapidTransfer(_PluginBase):
                                                 {"component": "th", "text": "重试进度"},
                                                 {"component": "th", "text": "下次重试时间"},
                                                 {"component": "th", "text": "拦截原因"},
+                                                {"component": "th", "text": "操作"},
                                             ],
                                         }
                                     ],
@@ -599,8 +723,11 @@ class U115RapidTransfer(_PluginBase):
     def stop_service(self) -> None:
         """停用插件并清理定时调度与内存状态。"""
         self._stop_event.set()
-        self._cancel_all_once_jobs()
+        cancelled = self._cancel_all_once_jobs()
+        with self._lock:
+            self._in_flight_retries.clear()
         self._enabled = False
+        logger.info(f"【115秒传助手】插件已停用，已清理 {cancelled} 个待执行重试任务")
 
     def _media_extensions(self) -> set[str]:
         """读取宿主配置的媒体文件后缀，缺失时使用内置默认集合。"""
@@ -727,6 +854,7 @@ class U115RapidTransfer(_PluginBase):
             on_rapid_failure=self._on_rapid_failure,
             is_stopped=self._stop_event.is_set,
         )
+        logger.debug("【115秒传助手】已为 u115 存储适配器注入只秒传代理")
 
     def _resolve_transfer_history_id(
         self,
@@ -742,7 +870,7 @@ class U115RapidTransfer(_PluginBase):
             if history is not None and getattr(history, "id", None):
                 return int(history.id)
         except Exception as err:
-            logger.debug(f"【115只秒传】查询源路径 {src_path} 整理历史异常：{err}")
+            logger.debug(f"【115秒传助手】查询源路径 {src_path} 整理历史异常：{err}")
         return None
 
     def _send_notice(self, title: str, text: str) -> None:
@@ -756,7 +884,7 @@ class U115RapidTransfer(_PluginBase):
                 text=text,
             )
         except Exception as err:
-            logger.debug(f"【115只秒传】发送通知失败：{err}")
+            logger.debug(f"【115秒传助手】发送通知失败：{err}")
 
     @eventmanager.register(EventType.TransferFailed)
     def on_transfer_failed(self, event: Optional[Event] = None) -> None:
@@ -802,7 +930,7 @@ class U115RapidTransfer(_PluginBase):
         if self._max_retries == 0:
             self._append_record(norm_path, "已拦截", f"{reason}（已关闭自动重试）")
             self._send_notice(
-                "【115只秒传】已阻止普通上传",
+                "【115秒传助手】已阻止普通上传",
                 f"文件：{media_title}\n路径：{norm_path}\n原因：{reason}\n未开启自动重试（最大重试次数为 0）。",
             )
             return
@@ -819,8 +947,11 @@ class U115RapidTransfer(_PluginBase):
                 "重试耗尽",
                 f"已达到最大重试次数 {self._max_retries} 次：{reason}",
             )
+            logger.warning(
+                f"【115秒传助手】{Path(norm_path).name} 已达到最大重试次数 {self._max_retries}，停止重试"
+            )
             self._send_notice(
-                "【115只秒传】达到最大重试次数",
+                "【115秒传助手】达到最大重试次数",
                 f"文件：{media_title}\n路径：{norm_path}\n已重试 {self._max_retries} 次仍未秒传成功，已停止自动重试。",
             )
             return
@@ -853,17 +984,17 @@ class U115RapidTransfer(_PluginBase):
         self._schedule_once_job(
             job_id,
             self._retry_transfer_item,
-            f"115只秒传重试({next_attempt}/{self._max_retries}): {Path(norm_path).name}",
+            f"115秒传助手重试({next_attempt}/{self._max_retries}): {Path(norm_path).name}",
             delay_seconds=self._retry_delay,
             func_kwargs={"src_path": norm_path},
         )
         logger.info(
-            f"【115只秒传】{Path(norm_path).name} 将在 {self._retry_delay} 秒后进行第 "
+            f"【115秒传助手】{Path(norm_path).name} 将在 {self._retry_delay} 秒后进行第 "
             f"{next_attempt}/{self._max_retries} 次重试"
         )
         if next_attempt == 1:
             self._send_notice(
-                "【115只秒传】已安排延迟重试",
+                "【115秒传助手】已安排延迟重试",
                 f"文件：{media_title}\n原因：{reason}\n将在 {self._retry_delay} 秒后进行第 {next_attempt}/{self._max_retries} 次重试。",
             )
 
@@ -885,8 +1016,11 @@ class U115RapidTransfer(_PluginBase):
             if removed is not None:
                 self._save_pending_retries(pending)
         if removed is not None:
+            logger.info(
+                f"【115秒传助手】{Path(norm_path).name} 重试秒传成功（第 {removed.get('attempt', 1)} 次），已移出待重试队列"
+            )
             self._send_notice(
-                "【115只秒传】重试秒传成功",
+                "【115秒传助手】重试秒传成功",
                 f"文件：{removed.get('title') or Path(norm_path).name}\n第 {removed.get('attempt', 1)} 次重试已成功完成整理。",
             )
 
@@ -899,6 +1033,7 @@ class U115RapidTransfer(_PluginBase):
         if _extract_attr_or_key(event_data, "action") != "u115_rapid_retry":
             return
         triggered = self.retry_all_pending()
+        logger.info(f"【115秒传助手】收到远程命令，已触发 {triggered} 个待重试任务")
         channel = _extract_attr_or_key(event_data, "channel")
         source = _extract_attr_or_key(event_data, "source")
         userid = _extract_attr_or_key(event_data, "user")
@@ -906,39 +1041,44 @@ class U115RapidTransfer(_PluginBase):
             channel=channel,
             source=source,
             userid=userid,
-            title="【115只秒传】手动重试",
+            title="【115秒传助手】手动重试",
             text=f"已触发 {triggered} 个待重试文件的整理重试。",
         )
 
-    def _reschedule_persisted_retries(self) -> None:
+    def _reschedule_persisted_retries(self) -> int:
         """插件启用或重载时为持久化队列中尚未到期的任务恢复一次性调度。"""
         pending = self._load_pending_retries()
         if not pending:
-            return
+            return 0
         now = time.time()
         for norm_path, item in pending.items():
             delay = max(float(item.get("next_retry_at", now)) - now, 5.0)
             self._schedule_once_job(
                 self._make_retry_job_id(norm_path),
                 self._retry_transfer_item,
-                f"115只秒传恢复重试: {Path(norm_path).name}",
+                f"115秒传助手恢复重试: {Path(norm_path).name}",
                 delay_seconds=delay,
                 func_kwargs={"src_path": norm_path},
             )
+        return len(pending)
 
     def check_pending_retries(self) -> int:
         """巡检待重试队列，执行已到期的任务。"""
         if not self._enabled or self._stop_event.is_set():
             return 0
+        now = time.time()
+        self._last_scan_at = now
         pending = self._load_pending_retries()
         if not pending:
             return 0
-        now = time.time()
         due_paths = [
             norm_path
             for norm_path, item in pending.items()
             if float(item.get("next_retry_at", 0)) <= now
         ]
+        logger.debug(
+            f"【115秒传助手】巡检待重试队列：共 {len(pending)} 项，到期 {len(due_paths)} 项"
+        )
         executed = 0
         for norm_path in due_paths:
             if self._stop_event.is_set():
@@ -963,77 +1103,100 @@ class U115RapidTransfer(_PluginBase):
 
         norm_path = _normalize_path(src_path)
         with self._lock:
+            if norm_path in self._in_flight_retries:
+                logger.debug(f"【115秒传助手】{Path(norm_path).name} 正在执行重试，跳过并发重入")
+                return False
+            self._in_flight_retries.add(norm_path)
             self._scheduled_job_ids.discard(self._make_retry_job_id(norm_path))
             pending = self._load_pending_retries()
             entry = pending.get(norm_path)
 
-        if not entry:
-            return False
+        try:
+            if not entry:
+                return False
 
-        raw_src = str(entry.get("raw_src_path") or norm_path)
-        src_storage = str(entry.get("src_storage") or "local")
-
-        if src_storage == "local" and not Path(raw_src).is_file():
-            logger.info(f"【115只秒传】本地源文件已不存在，移除待重试项：{raw_src}")
-            with self._lock:
-                pending = self._load_pending_retries()
-                pending.pop(norm_path, None)
-                self._save_pending_retries(pending)
-            self._append_record(norm_path, "已跳过", "本地源文件已不存在")
-            return False
-
-        history_oper = TransferHistoryOper()
-        history = history_oper.get_by_src(raw_src, storage=src_storage)
-        history_id = getattr(history, "id", None) if history is not None else entry.get("history_id")
-        if history is not None and getattr(history, "status", False):
-            logger.info(f"【115只秒传】整理历史已成功，移除待重试项：{norm_path}")
-            with self._lock:
-                pending = self._load_pending_retries()
-                pending.pop(norm_path, None)
-                self._save_pending_retries(pending)
-            return False
-
-        if not history_id:
-            logger.warning(f"【115只秒传】找不到整理历史记录，无法重试：{norm_path}")
-            with self._lock:
-                pending = self._load_pending_retries()
-                pending.pop(norm_path, None)
-                self._save_pending_retries(pending)
-            self._append_record(norm_path, "取消重试", "缺少对应的整理历史记录")
-            return False
-
-        attempt = int(entry.get("attempt", 1))
-        logger.info(
-            f"【115只秒传】开始执行第 {attempt}/{entry.get('max_retries', self._max_retries)} 次重试："
-            f"{Path(norm_path).name} (history_id={history_id})"
-        )
-        self._append_record(norm_path, "发起重试", f"第 {attempt} 次重试（history_id={history_id}）")
-        state, errmsg = TransferChain().redo_transfer_history(int(history_id))
-        if not state:
-            msg = str(errmsg or "未知错误")
-            logger.warning(f"【115只秒传】触发重试失败：{norm_path} - {msg}")
-            if "不存在" in msg:
+            attempt = int(entry.get("attempt", 1))
+            if self._max_retries == 0 or attempt > self._max_retries:
+                logger.info(
+                    f"【115秒传助手】{Path(norm_path).name} 当前尝试次数({attempt})超过最新上限({self._max_retries})，移除待重试项"
+                )
                 with self._lock:
                     pending = self._load_pending_retries()
                     pending.pop(norm_path, None)
                     self._save_pending_retries(pending)
-                self._append_record(norm_path, "取消重试", msg)
-            else:
+                self._append_record(
+                    norm_path,
+                    "取消重试",
+                    f"当前尝试次数 {attempt} 超过最大限制 {self._max_retries}",
+                )
+                return False
+
+            raw_src = str(entry.get("raw_src_path") or norm_path)
+            src_storage = str(entry.get("src_storage") or "local")
+
+            if src_storage == "local" and not Path(raw_src).is_file():
+                logger.info(f"【115秒传助手】本地源文件已不存在，移除待重试项：{raw_src}")
                 with self._lock:
                     pending = self._load_pending_retries()
-                    if norm_path in pending:
-                        pending[norm_path]["next_retry_at"] = time.time() + self._retry_delay
-                        pending[norm_path]["last_error"] = msg
+                    pending.pop(norm_path, None)
+                    self._save_pending_retries(pending)
+                self._append_record(norm_path, "已跳过", "本地源文件已不存在")
+                return False
+
+            history_oper = TransferHistoryOper()
+            history = history_oper.get_by_src(raw_src, storage=src_storage)
+            history_id = getattr(history, "id", None) if history is not None else entry.get("history_id")
+            if history is not None and getattr(history, "status", False):
+                logger.info(f"【115秒传助手】整理历史已成功，移除待重试项：{norm_path}")
+                with self._lock:
+                    pending = self._load_pending_retries()
+                    pending.pop(norm_path, None)
+                    self._save_pending_retries(pending)
+                return False
+
+            if not history_id:
+                logger.warning(f"【115秒传助手】找不到整理历史记录，无法重试：{norm_path}")
+                with self._lock:
+                    pending = self._load_pending_retries()
+                    pending.pop(norm_path, None)
+                    self._save_pending_retries(pending)
+                self._append_record(norm_path, "取消重试", "缺少对应的整理历史记录")
+                return False
+
+            logger.info(
+                f"【115秒传助手】开始执行第 {attempt}/{self._max_retries} 次重试："
+                f"{Path(norm_path).name} (history_id={history_id})"
+            )
+            self._append_record(norm_path, "发起重试", f"第 {attempt} 次重试（history_id={history_id}）")
+            state, errmsg = TransferChain().redo_transfer_history(int(history_id))
+            if not state:
+                msg = str(errmsg or "未知错误")
+                logger.warning(f"【115秒传助手】触发重试失败：{norm_path} - {msg}")
+                if "不存在" in msg:
+                    with self._lock:
+                        pending = self._load_pending_retries()
+                        pending.pop(norm_path, None)
                         self._save_pending_retries(pending)
-                self._schedule_once_job(
-                    self._make_retry_job_id(norm_path),
-                    self._retry_transfer_item,
-                    f"115只秒传重试顺延: {Path(norm_path).name}",
-                    delay_seconds=self._retry_delay,
-                    func_kwargs={"src_path": norm_path},
-                )
-            return False
-        return True
+                    self._append_record(norm_path, "取消重试", msg)
+                else:
+                    with self._lock:
+                        pending = self._load_pending_retries()
+                        if norm_path in pending:
+                            pending[norm_path]["next_retry_at"] = time.time() + self._retry_delay
+                            pending[norm_path]["last_error"] = msg
+                            self._save_pending_retries(pending)
+                    self._schedule_once_job(
+                        self._make_retry_job_id(norm_path),
+                        self._retry_transfer_item,
+                        f"115秒传助手重试顺延: {Path(norm_path).name}",
+                        delay_seconds=self._retry_delay,
+                        func_kwargs={"src_path": norm_path},
+                    )
+                return False
+            return True
+        finally:
+            with self._lock:
+                self._in_flight_retries.discard(norm_path)
 
     def api_get_status(self) -> Response[RapidTransferStatusData]:
         """返回插件运行状态、统计与待重试队列。"""
@@ -1061,12 +1224,14 @@ class U115RapidTransfer(_PluginBase):
             )
         if src_path:
             ok = self._retry_transfer_item(src_path=src_path)
+            logger.info(f"【115秒传助手】手动单条重试：{src_path} -> {'成功' if ok else '失败/未命中'}")
             return Response(
                 success=ok,
                 message="已触发重试" if ok else "未找到任务或触发失败",
                 data=RapidTransferActionData(count=1 if ok else 0),
             )
         triggered = self.retry_all_pending()
+        logger.info(f"【115秒传助手】手动全部重试：已触发 {triggered} 个任务")
         return Response(
             success=True,
             message=f"已触发 {triggered} 个重试任务",
@@ -1097,8 +1262,22 @@ class U115RapidTransfer(_PluginBase):
                     remove_job(self.__class__.__name__, job_id)
                 except Exception:
                     pass
+        logger.info(f"【115秒传助手】清理待重试队列：共移除 {len(job_ids)} 项")
         return Response(
             success=True,
             message=f"已清理 {len(job_ids)} 个待重试任务",
             data=RapidTransferActionData(count=len(job_ids)),
+        )
+
+    def api_clear_records(self) -> Response[RapidTransferActionData]:
+        """清空最近处理记录。"""
+        with self._lock:
+            records = self._load_records()
+            count = len(records)
+            self.save_data("records", [])
+        logger.info(f"【115秒传助手】已清空 {count} 条处理记录")
+        return Response(
+            success=True,
+            message=f"已清空 {count} 条处理记录",
+            data=RapidTransferActionData(count=count),
         )

@@ -10,7 +10,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.plugins.u115rapidtransfer import U115RapidTransfer
-from app.plugins.u115rapidtransfer.rapid_proxy import calc_sha1, calc_slice_sha1_upper
+from app.plugins.u115rapidtransfer.rapid_proxy import (
+    calc_file_digests,
+    calc_sha1,
+    calc_slice_sha1_upper,
+)
 from app.schemas.event import StorageOperSelectionEventData
 from app.schemas.file import FileItem
 from app.schemas.types import StorageSchema
@@ -293,3 +297,130 @@ def test_form_page_and_api_responses(plugin):
     status_resp = plugin.api_get_status()
     assert status_resp.success is True
     assert status_resp.data.enabled is True
+    assert plugin.plugin_name == "115秒传助手"
+    assert plugin.plugin_icon == "U115RapidTransfer.png"
+    assert plugin.plugin_version == "1.1.0"
+
+
+def test_calc_file_digests_and_stop_interrupt(tmp_path):
+    """单次顺序哈希与分次 calc_sha1 结果一致，且支持停用中断。"""
+    sample = tmp_path / "sample.mkv"
+    payload = b"0123456789abcdef" * 5000
+    sample.write_bytes(payload)
+
+    full_sha1, pre_sha1 = calc_file_digests(sample, preid_bytes=1024)
+    assert full_sha1 == calc_sha1(sample)
+    assert pre_sha1 == calc_sha1(sample, 1024)
+
+    with pytest.raises(InterruptedError):
+        calc_file_digests(sample, is_stopped=lambda: True)
+
+
+def test_lifecycle_logging_and_in_flight_retry_guard(plugin, tmp_path, monkeypatch):
+    """初始化与停用应写日志；同一文件并发重试应防重入；超限任务应被清理。"""
+    from app.plugins import u115rapidtransfer as plugin_mod
+
+    logged = []
+    monkeypatch.setattr(plugin_mod.logger, "info", lambda msg: logged.append(str(msg)))
+
+    plugin.init_plugin({"enabled": True, "retry_delay": 300, "max_retries": 2})
+    assert any("插件已启用" in msg for msg in logged)
+
+    media_file = tmp_path / "Concurrent.2026.mkv"
+    media_file.write_bytes(b"video")
+    norm_path = media_file.as_posix()
+
+    plugin.save_data(
+        "pending_retries",
+        {
+            norm_path: {
+                "src_path": norm_path,
+                "raw_src_path": str(media_file),
+                "src_storage": "local",
+                "history_id": 101,
+                "attempt": 1,
+                "max_retries": 2,
+                "next_retry_at": 0,
+                "last_error": "秒传未命中",
+            }
+        },
+    )
+
+    plugin._in_flight_retries.add(norm_path)
+    assert plugin._retry_transfer_item(norm_path) is False
+    plugin._in_flight_retries.discard(norm_path)
+
+    # 调小 max_retries 后，超限的旧任务在巡检时会被清理而不重复投递
+    plugin._max_retries = 1
+    plugin.save_data(
+        "pending_retries",
+        {
+            norm_path: {
+                "src_path": norm_path,
+                "raw_src_path": str(media_file),
+                "src_storage": "local",
+                "history_id": 101,
+                "attempt": 2,
+                "max_retries": 5,
+                "next_retry_at": 0,
+                "last_error": "秒传未命中",
+            }
+        },
+    )
+    assert plugin.check_pending_retries() == 0
+    assert norm_path not in plugin._load_pending_retries()
+
+    plugin.stop_service()
+    assert any("插件已停用" in msg for msg in logged)
+
+
+def test_get_page_actions_and_clear_records(plugin, tmp_path):
+    """详情页包含快捷操作按钮且清空处理记录接口工作正常。"""
+    plugin._append_record((tmp_path / "A.mkv").as_posix(), "秒传成功", "测试")
+    assert len(plugin._load_records()) == 1
+
+    page_json = str(plugin.get_page())
+    assert "plugin/U115RapidTransfer/retry" in page_json
+    assert "plugin/U115RapidTransfer/clear" in page_json
+    assert "plugin/U115RapidTransfer/clear_records" in page_json
+
+    clear_resp = plugin.api_clear_records()
+    assert clear_resp.success is True
+    assert clear_resp.data.count == 1
+    assert plugin._load_records() == []
+
+
+def test_confirm_rapid_item_handles_non_numeric_file_id_and_api_error(plugin, tmp_path, monkeypatch):
+    """get_info 异常或非数字 file_id 时仍回退成功返回 FileItem。"""
+    from app.plugins.u115rapidtransfer import rapid_proxy
+
+    monkeypatch.setattr(rapid_proxy.time, "sleep", lambda _sec: None)
+
+    media_file = tmp_path / "Fallback.2026.mkv"
+    media_file.write_bytes(b"fallback-content")
+
+    delegate = MagicMock()
+    delegate.schema = StorageSchema.U115
+    delegate._check_session = MagicMock()
+    delegate.get_item = MagicMock(return_value=None)
+    delegate.upload = MagicMock(side_effect=AssertionError("不应回退普通上传"))
+
+    def request_api(method, endpoint, result_key=None, **kwargs):
+        if endpoint == "/open/upload/init":
+            return {"state": True, "data": {"status": 2, "file_id": "non-numeric-id"}}
+        if endpoint == "/open/folder/get_info":
+            raise RuntimeError("transient error")
+        return None
+
+    delegate._request_api = request_api
+    plugin._create_u115_delegate = lambda: delegate
+
+    sel_event = SimpleNamespace(event_data=StorageOperSelectionEventData(storage="u115"))
+    plugin.on_storage_oper_selection(sel_event)
+    proxy = sel_event.event_data.storage_oper
+
+    target_dir = FileItem(storage="u115", fileid="100", path="/Movies/", type="dir", name="Movies")
+    res = proxy.upload(target_dir, media_file)
+    assert res is not None
+    assert res.name == "Fallback.2026.mkv"
+    assert res.size == len(b"fallback-content")

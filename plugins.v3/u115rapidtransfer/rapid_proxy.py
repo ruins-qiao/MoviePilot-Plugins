@@ -13,6 +13,31 @@ from app.schemas.types import StorageSchema
 from app.sdk.logging import logger
 
 
+def calc_file_digests(
+    filepath: Path,
+    preid_bytes: int = 128 * 1024 * 1024,
+    is_stopped: Optional[Callable[[], bool]] = None,
+) -> tuple[str, str]:
+    """单次顺序读取本地文件，同时计算全量 SHA1 与前 ``preid_bytes`` 字节摘要。"""
+    full_sha1 = hashlib.sha1()
+    pre_sha1 = hashlib.sha1()
+    pre_remaining = max(preid_bytes, 0)
+    chunk_size = 65536
+    with open(filepath, "rb") as file_obj:
+        while chunk := file_obj.read(chunk_size):
+            if is_stopped and is_stopped():
+                raise InterruptedError("插件已停用，中止秒传哈希计算")
+            full_sha1.update(chunk)
+            if pre_remaining > 0:
+                if len(chunk) <= pre_remaining:
+                    pre_sha1.update(chunk)
+                    pre_remaining -= len(chunk)
+                else:
+                    pre_sha1.update(chunk[:pre_remaining])
+                    pre_remaining = 0
+    return full_sha1.hexdigest(), pre_sha1.hexdigest()
+
+
 def calc_sha1(filepath: Path, size: Optional[int] = None) -> str:
     """计算本地文件完整 SHA1 或前 ``size`` 字节的十六进制摘要。"""
     sha1 = hashlib.sha1()
@@ -20,13 +45,13 @@ def calc_sha1(filepath: Path, size: Optional[int] = None) -> str:
         if size:
             remaining = size
             while remaining > 0:
-                chunk = file_obj.read(min(8192, remaining))
+                chunk = file_obj.read(min(65536, remaining))
                 if not chunk:
                     break
                 sha1.update(chunk)
                 remaining -= len(chunk)
         else:
-            while chunk := file_obj.read(8192):
+            while chunk := file_obj.read(65536):
                 sha1.update(chunk)
     return sha1.hexdigest()
 
@@ -219,8 +244,13 @@ class U115RapidStorageProxy(StorageBase):
             except Exception as err:
                 return None, f"115 登录凭据不可用：{err}"
 
-        file_sha1 = calc_sha1(local_path)
-        file_preid = calc_sha1(local_path, 128 * 1024 * 1024)
+        if self._is_stopped():
+            raise InterruptedError("插件已停用，中止秒传初始化")
+
+        file_sha1, file_preid = calc_file_digests(
+            local_path,
+            is_stopped=self._is_stopped,
+        )
         init_data: dict[str, Any] = {
             "file_name": target_name,
             "file_size": file_size,
@@ -242,6 +272,7 @@ class U115RapidStorageProxy(StorageBase):
         pick_code = init_result.get("pick_code")
         sign_key = init_result.get("sign_key")
         if init_result.get("code") in (700, 701) and sign_check:
+            logger.debug(f"【115秒传助手】{target_name} 需要二次区段校验：{sign_check}")
             try:
                 start_str, end_str = str(sign_check).split("-", 1)
                 sign_val = calc_slice_sha1_upper(local_path, int(start_str), int(end_str))
@@ -279,13 +310,21 @@ class U115RapidStorageProxy(StorageBase):
         if file_id and callable(request_api):
             if not self._is_stopped():
                 time.sleep(2)
-            info_resp = request_api(
-                "GET",
-                "/open/folder/get_info",
-                "data",
-                params={"file_id": int(file_id)},
-            )
-            if isinstance(info_resp, dict) and info_resp:
+            try:
+                fid_param: int | str = int(file_id)
+            except (TypeError, ValueError):
+                fid_param = str(file_id)
+            try:
+                info_resp = request_api(
+                    "GET",
+                    "/open/folder/get_info",
+                    "data",
+                    params={"file_id": fid_param},
+                )
+            except Exception as err:
+                logger.debug(f"【115秒传助手】查询秒传文件详情失败，将回退路径查询：{err}")
+                info_resp = None
+            if isinstance(info_resp, dict) and info_resp.get("file_id"):
                 return build_fileitem_from_info(info_resp, target_path)
 
         uploaded_item = self._delegate.get_item(target_path)
@@ -299,22 +338,26 @@ class U115RapidStorageProxy(StorageBase):
     ) -> Optional[FileItem]:
         """上传文件；受控文件仅允许 115 秒传，秒传失败时直接返回 None。"""
         if not path or not path.is_file():
-            logger.warning(f"【115只秒传】本地源文件不存在，无法上传：{path}")
+            logger.warning(f"【115秒传助手】本地源文件不存在，无法上传：{path}")
             return None
 
         if not self._should_enforce_rapid(path):
+            logger.debug(f"【115秒传助手】文件不满足只秒传拦截条件，放行普通上传：{path.name}")
             return self._delegate.upload(fileitem, path, new_name)
 
         resolved_dir = self._resolve_target_dir(fileitem)
         if not resolved_dir or not resolved_dir.fileid or not resolved_dir.path:
             reason = f"目标目录缺少 115 目录标识：{fileitem.path}"
-            logger.warning(f"【115只秒传】{reason}")
+            logger.warning(f"【115秒传助手】{reason}")
             self._on_rapid_failure(path, None, reason)
             return None
 
         target_name = new_name or path.name
         target_path = Path(cast(str, resolved_dir.path)) / target_name
         file_size = path.stat().st_size
+        logger.debug(
+            f"【115秒传助手】开始秒传校验：{target_name} -> {target_path.as_posix()} (size={file_size})"
+        )
 
         try:
             init_result, error_msg = self._request_upload_init(
@@ -323,23 +366,26 @@ class U115RapidStorageProxy(StorageBase):
                 target_cid=resolved_dir.fileid,
                 file_size=file_size,
             )
+        except InterruptedError as err:
+            logger.info(f"【115秒传助手】{err}：{target_name}")
+            return None
         except Exception as err:
             error_msg = f"115 秒传检测异常：{err}"
             init_result = None
 
         if init_result is None:
-            logger.warning(f"【115只秒传】{target_name} {error_msg}，已禁止普通上传")
+            logger.warning(f"【115秒传助手】{target_name} {error_msg}，已禁止普通上传")
             self._on_rapid_failure(path, target_path.as_posix(), error_msg)
             return None
 
         status = init_result.get("status")
         if status != 2:
             reason = f"秒传未命中（status={status}），已拒绝普通上传"
-            logger.warning(f"【115只秒传】{target_name} {reason}")
+            logger.warning(f"【115秒传助手】{target_name} {reason}")
             self._on_rapid_failure(path, target_path.as_posix(), reason)
             return None
 
-        logger.info(f"【115只秒传】{target_name} 秒传成功")
+        logger.info(f"【115秒传助手】{target_name} 秒传成功")
         uploaded = self._confirm_rapid_item(
             init_result=init_result,
             target_path=target_path,
