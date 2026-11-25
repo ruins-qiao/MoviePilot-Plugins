@@ -95,7 +95,7 @@ class U115RapidTransfer(_PluginBase):
     plugin_name = "115秒传助手"
     plugin_desc = "整理文件到115网盘时仅允许秒传（禁止普通上传），秒传失败后等待指定时间自动重试。"
     plugin_icon = "U115RapidTransfer.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_author = "qiaoba"
     author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
     plugin_config_prefix = "u115rapidtransfer_"
