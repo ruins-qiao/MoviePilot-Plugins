@@ -299,7 +299,7 @@ def test_form_page_and_api_responses(plugin):
     assert status_resp.data.enabled is True
     assert plugin.plugin_name == "115秒传助手"
     assert plugin.plugin_icon == "https://raw.githubusercontent.com/ruins-qiao/MoviePilot-Plugins/main/icons/U115RapidTransfer.png"
-    assert plugin.plugin_version == "1.1.1"
+    assert plugin.plugin_version == "1.1.2"
 
 
 def test_calc_file_digests_and_stop_interrupt(tmp_path):
@@ -445,3 +445,43 @@ def test_storage_proxy_implements_and_delegates_check():
 
     delegate.check.return_value = False
     assert proxy.check() is False
+
+
+def test_storage_proxy_delegates_strict_query_and_concrete_base_methods():
+    """代理类必须显式转发 get_item_strict 等基类已实现方法，避免被基类兜底异常截断。"""
+    from app.plugins.u115rapidtransfer.rapid_proxy import U115RapidStorageProxy
+
+    for method_name in (
+        "get_item_strict",
+        "list_strict",
+        "support_transtype",
+        "is_support_transtype",
+        "generate_qrcode",
+        "generate_auth_url",
+        "check_login",
+        "reflink",
+    ):
+        assert method_name in U115RapidStorageProxy.__dict__
+
+    expected_item = FileItem(storage="u115", fileid="777", path="/tv/show.mkv", type="file", name="show.mkv")
+    delegate = MagicMock()
+    delegate.get_item_strict.return_value = expected_item
+    delegate.list_strict.return_value = [expected_item]
+    delegate.copy.return_value = True
+
+    proxy = U115RapidStorageProxy(
+        delegate,
+        should_enforce_rapid=lambda _path: True,
+        on_rapid_success=lambda _path, _target: None,
+        on_rapid_failure=lambda _path, _target, _reason: None,
+    )
+    target = Path("/tv/show.mkv")
+    assert proxy.get_item_strict(target) == expected_item
+    delegate.get_item_strict.assert_called_once_with(target)
+
+    dir_item = FileItem(storage="u115", fileid="100", path="/tv/", type="dir", name="tv")
+    assert proxy.list_strict(dir_item) == [expected_item]
+    delegate.list_strict.assert_called_once_with(dir_item)
+
+    assert proxy.copy(expected_item, Path("/tv2"), "new.mkv", extra="v") is True
+    delegate.copy.assert_called_once_with(expected_item, Path("/tv2"), "new.mkv", extra="v")

@@ -158,9 +158,49 @@ class U115RapidStorageProxy(StorageBase):
         """关闭请求不应销毁共享的底层 115 单例客户端。"""
         return None
 
+    def generate_qrcode(self, *args: Any, **kwargs: Any) -> Any:
+        """委托生成登录二维码。"""
+        return self._delegate.generate_qrcode(*args, **kwargs)
+
+    def generate_auth_url(self, *args: Any, **kwargs: Any) -> Any:
+        """委托生成 OAuth 授权地址。"""
+        return self._delegate.generate_auth_url(*args, **kwargs)
+
+    def check_login(self, *args: Any, **kwargs: Any) -> Any:
+        """委托检查登录状态。"""
+        return self._delegate.check_login(*args, **kwargs)
+
+    def get_config(self) -> Any:
+        """委托读取完整存储配置。"""
+        return self._delegate.get_config()
+
+    def get_conf(self) -> dict[str, Any]:
+        """委托读取存储配置字典。"""
+        return self._delegate.get_conf()
+
+    def set_config(self, conf: dict[str, object]) -> None:
+        """委托持久化存储配置。"""
+        self._delegate.set_config(conf)
+
+    def reset_config(self) -> None:
+        """委托重置存储配置。"""
+        self._delegate.reset_config()
+
+    def support_transtype(self) -> dict[str, str]:
+        """委托返回支持的整理方式。"""
+        return self._delegate.support_transtype()
+
+    def is_support_transtype(self, transtype: str) -> bool:
+        """委托判断是否支持指定整理方式。"""
+        return bool(self._delegate.is_support_transtype(transtype))
+
     def list(self, fileitem: FileItem) -> list[FileItem]:
         """委托列举目录子项。"""
         return self._delegate.list(fileitem)
+
+    def list_strict(self, fileitem: FileItem) -> list[FileItem]:
+        """委托严格列举目录子项，确保透传底层严格查询能力。"""
+        return self._delegate.list_strict(fileitem)
 
     def create_folder(self, fileitem: FileItem, name: str) -> Optional[FileItem]:
         """委托创建目录。"""
@@ -173,6 +213,10 @@ class U115RapidStorageProxy(StorageBase):
     def get_item(self, path: Path) -> Optional[FileItem]:
         """委托按路径查询文件或目录。"""
         return self._delegate.get_item(path)
+
+    def get_item_strict(self, path: Path) -> Optional[FileItem]:
+        """委托严格查询目标路径状态，避免继承基类抛出未实现严格查询异常。"""
+        return self._delegate.get_item_strict(path)
 
     def get_parent(self, fileitem: FileItem) -> Optional[FileItem]:
         """委托获取父目录项。"""
@@ -194,9 +238,9 @@ class U115RapidStorageProxy(StorageBase):
         """委托查询文件详情。"""
         return self._delegate.detail(fileitem)
 
-    def copy(self, fileitem: FileItem, path: Path, new_name: str) -> bool:
+    def copy(self, fileitem: FileItem, path: Path, new_name: str, **kwargs: Any) -> bool:
         """委托复制文件。"""
-        return self._delegate.copy(fileitem, path, new_name)
+        return self._delegate.copy(fileitem, path, new_name, **kwargs)
 
     def move(self, fileitem: FileItem, path: Path, new_name: str) -> bool:
         """委托移动文件。"""
@@ -209,6 +253,10 @@ class U115RapidStorageProxy(StorageBase):
     def softlink(self, fileitem: FileItem, target_file: Path) -> bool:
         """委托软链接操作。"""
         return self._delegate.softlink(fileitem, target_file)
+
+    def reflink(self, fileitem: FileItem, target_file: Path) -> bool:
+        """委托引用链接操作。"""
+        return bool(self._delegate.reflink(fileitem, target_file))
 
     def usage(self) -> Optional[StorageUsage]:
         """委托查询存储容量。"""

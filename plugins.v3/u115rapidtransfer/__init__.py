@@ -95,7 +95,7 @@ class U115RapidTransfer(_PluginBase):
     plugin_name = "115秒传助手"
     plugin_desc = "整理文件到115网盘时仅允许秒传（禁止普通上传），秒传失败后等待指定时间自动重试。"
     plugin_icon = "https://raw.githubusercontent.com/ruins-qiao/MoviePilot-Plugins/main/icons/U115RapidTransfer.png"
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.2"
     plugin_author = "qiaoba"
     author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
     plugin_config_prefix = "u115rapidtransfer_"
@@ -854,7 +854,7 @@ class U115RapidTransfer(_PluginBase):
             on_rapid_failure=self._on_rapid_failure,
             is_stopped=self._stop_event.is_set,
         )
-        logger.debug("【115秒传助手】已为 u115 存储适配器注入只秒传代理")
+        logger.info("【115秒传助手】已接管 u115 存储操作，启用只秒传模式")
 
     def _resolve_transfer_history_id(
         self,
