@@ -424,3 +424,24 @@ def test_confirm_rapid_item_handles_non_numeric_file_id_and_api_error(plugin, tm
     assert res is not None
     assert res.name == "Fallback.2026.mkv"
     assert res.size == len(b"fallback-content")
+
+
+def test_storage_proxy_implements_and_delegates_check():
+    """U115RapidStorageProxy 必须直接实现 check() 抽象方法并委托底层存储。"""
+    from app.plugins.u115rapidtransfer.rapid_proxy import U115RapidStorageProxy
+
+    assert "check" in U115RapidStorageProxy.__dict__
+
+    delegate = MagicMock()
+    delegate.check.return_value = True
+    proxy = U115RapidStorageProxy(
+        delegate,
+        should_enforce_rapid=lambda _path: True,
+        on_rapid_success=lambda _path, _target: None,
+        on_rapid_failure=lambda _path, _target, _reason: None,
+    )
+    assert proxy.check() is True
+    delegate.check.assert_called_once_with()
+
+    delegate.check.return_value = False
+    assert proxy.check() is False

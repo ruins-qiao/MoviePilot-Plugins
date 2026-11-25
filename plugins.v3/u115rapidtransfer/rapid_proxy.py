@@ -150,6 +150,10 @@ class U115RapidStorageProxy(StorageBase):
         """委托底层 115 存储初始化。"""
         self._delegate.init_storage()
 
+    def check(self) -> bool:
+        """委托检查底层 115 存储是否可用。"""
+        return bool(self._delegate.check())
+
     def close(self) -> bool | None:
         """关闭请求不应销毁共享的底层 115 单例客户端。"""
         return None
