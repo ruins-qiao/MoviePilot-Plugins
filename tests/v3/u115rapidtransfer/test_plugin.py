@@ -390,6 +390,43 @@ def test_get_page_actions_and_clear_records(plugin, tmp_path):
     assert plugin._load_records() == []
 
 
+def test_beautified_ui_layout_and_notifications(plugin, tmp_path):
+    """配置页分组、详情页概览及通知文案排版应符合精简可读设计。"""
+    form, _ = plugin.get_form()
+    form_text = str(form)
+    assert "基础控制" in form_text
+    assert "拦截范围" in form_text
+    assert "重试与巡检策略" in form_text
+    assert "VExpansionPanels" in form_text
+
+    for idx in range(12):
+        plugin._append_record(
+            (tmp_path / f"Movie.{idx}.mkv").as_posix(),
+            "秒传成功",
+            f"目标：/Media/Movies/FolderA/FolderB/Movie.{idx}.mkv",
+        )
+    page_text = str(plugin.get_page())
+    assert "待重试任务" in page_text
+    assert "累计秒传成功" in page_text
+    assert "展示最近 10 条（共 12 条）" in page_text
+    assert ".../FolderA/FolderB/Movie.11.mkv" in page_text
+
+    plugin.on_plugin_action(
+        SimpleNamespace(
+            event_data=SimpleNamespace(
+                action="u115_rapid_retry",
+                channel="telegram",
+                source="chat1",
+                user="u1",
+            )
+        )
+    )
+    plugin.post_message.assert_called()
+    last_call = plugin.post_message.call_args.kwargs
+    assert "手动重试" in last_call["title"]
+    assert "等待队列为空" in last_call["text"]
+
+
 def test_confirm_rapid_item_handles_non_numeric_file_id_and_api_error(plugin, tmp_path, monkeypatch):
     """get_info 异常或非数字 file_id 时仍回退成功返回 FileItem。"""
     from app.plugins.u115rapidtransfer import rapid_proxy

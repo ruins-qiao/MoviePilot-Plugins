@@ -50,7 +50,17 @@ _DEFAULT_MEDIA_EXTS = frozenset(
     }
 )
 _MAX_RECORD_HISTORY = 50
+_MAX_PAGE_RECORDS = 10
 _DEFAULT_CRON = "*/5 * * * *"
+_RECORD_STATUS_COLORS = {
+    "秒传成功": "success",
+    "发起重试": "info",
+    "秒传未命中": "warning",
+    "已拦截": "warning",
+    "重试耗尽": "error",
+    "取消重试": "error",
+    "已跳过": "default",
+}
 
 
 def _normalize_path(path: str | Path) -> str:
@@ -63,6 +73,162 @@ def _format_ts(ts: float | None) -> str:
     if not ts:
         return "-"
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _format_compact_ts(ts: float | None, now: float | None = None) -> str:
+    """将时间戳格式化为适合界面展示的精简日期时间。"""
+    if not ts:
+        return "-"
+    dt = datetime.fromtimestamp(ts)
+    ref = datetime.fromtimestamp(now if now is not None else time.time())
+    day_diff = (ref.date() - dt.date()).days
+    if day_diff == 0:
+        return f"今天 {dt.strftime('%H:%M')}"
+    if day_diff == 1:
+        return f"昨天 {dt.strftime('%H:%M')}"
+    return dt.strftime("%m-%d %H:%M")
+
+
+def _format_duration(seconds: int | float) -> str:
+    """将秒数格式化为易读的中文时长描述。"""
+    total = max(int(round(seconds)), 0)
+    if total < 60:
+        return f"{total} 秒"
+    minutes, rem_sec = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes} 分钟" if rem_sec == 0 else f"{minutes} 分 {rem_sec} 秒"
+    hours, rem_min = divmod(minutes, 60)
+    return f"{hours} 小时" if rem_min == 0 else f"{hours} 小时 {rem_min} 分钟"
+
+
+def _format_relative_retry(
+    next_retry_at: float | None,
+    now: float | None = None,
+) -> tuple[str, str]:
+    """返回待重试任务的相对倒计时与精简时钟时刻。"""
+    if not next_retry_at:
+        return "-", "-"
+    current = now if now is not None else time.time()
+    delta = float(next_retry_at) - current
+    dt = datetime.fromtimestamp(float(next_retry_at))
+    clock = dt.strftime("%H:%M:%S") if dt.date() == datetime.fromtimestamp(current).date() else dt.strftime("%m-%d %H:%M")
+    if delta <= 0:
+        return "即将巡检", clock
+    if delta < 60:
+        return f"约 {max(int(round(delta)), 1)} 秒后", clock
+    return f"约 {_format_duration(delta)}后", clock
+
+
+def _shorten_path(path: str | Path, max_parts: int = 3) -> str:
+    """缩短长路径展示，保留末尾若干级目录与文件名。"""
+    text = str(path or "").strip()
+    if not text:
+        return "-"
+    parts = [part for part in Path(text).as_posix().split("/") if part]
+    if len(parts) <= max_parts:
+        return text
+    return f".../{'/'.join(parts[-max_parts:])}"
+
+
+def _format_record_detail(message: str) -> str:
+    """精简处理记录中的目标路径详情，降低长路径带来的视觉噪音。"""
+    text = str(message or "-").strip() or "-"
+    if text.startswith("目标："):
+        target = text[len("目标：") :].strip()
+        return f"目标：{_shorten_path(target, max_parts=3)}"
+    return text
+
+
+def _format_notice_body(rows: list[tuple[str, str]], tip: str | None = None) -> str:
+    """将多行键值对和可选底部提示统一排版为整洁的通知正文。"""
+    lines = [f"{label}：{value}" for label, value in rows if value]
+    if tip:
+        lines.append("")
+        lines.append(tip)
+    return "\n".join(lines)
+
+
+def _build_kpi_card(
+    title: str,
+    value: Any,
+    unit: str,
+    color: str,
+    icon: str,
+) -> dict[str, Any]:
+    """构造详情页顶部统一风格的 KPI 统计卡片。"""
+    return {
+        "component": "VCol",
+        "props": {"cols": 6, "md": 3},
+        "content": [
+            {
+                "component": "VCard",
+                "props": {"variant": "outlined", "class": "h-100"},
+                "content": [
+                    {
+                        "component": "VCardText",
+                        "props": {"class": "pa-4 d-flex align-center justify-space-between"},
+                        "content": [
+                            {
+                                "component": "div",
+                                "content": [
+                                    {
+                                        "component": "div",
+                                        "props": {"class": "text-caption text-medium-emphasis mb-1"},
+                                        "text": title,
+                                    },
+                                    {
+                                        "component": "div",
+                                        "props": {"class": "d-flex align-baseline ga-1"},
+                                        "content": [
+                                            {
+                                                "component": "span",
+                                                "props": {"class": f"text-h5 font-weight-bold text-{color}"},
+                                                "text": str(value),
+                                            },
+                                            {
+                                                "component": "span",
+                                                "props": {"class": "text-caption text-medium-emphasis"},
+                                                "text": unit,
+                                            },
+                                        ],
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VAvatar",
+                                "props": {"color": color, "variant": "tonal", "size": 38, "rounded": "lg"},
+                                "content": [
+                                    {
+                                        "component": "VIcon",
+                                        "props": {"icon": icon, "size": 20},
+                                    }
+                                ],
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def _build_empty_state(icon: str, text: str) -> dict[str, Any]:
+    """构造卡片内居中的柔和空状态占位块。"""
+    return {
+        "component": "VCardText",
+        "props": {"class": "py-6 text-center text-medium-emphasis"},
+        "content": [
+            {
+                "component": "VIcon",
+                "props": {"icon": icon, "size": 28, "class": "mb-2 opacity-70"},
+            },
+            {
+                "component": "div",
+                "props": {"class": "text-body-2"},
+                "text": text,
+            },
+        ],
+    }
 
 
 def _extract_attr_or_key(obj: Any, key: str, default: Any = None) -> Any:
@@ -95,7 +261,7 @@ class U115RapidTransfer(_PluginBase):
     plugin_name = "115秒传助手"
     plugin_desc = "整理文件到115网盘时仅允许秒传（禁止普通上传），秒传失败后等待指定时间自动重试。"
     plugin_icon = "https://raw.githubusercontent.com/ruins-qiao/MoviePilot-Plugins/main/icons/U115RapidTransfer.png"
-    plugin_version = "1.1.2"
+    plugin_version = "1.1.3"
     plugin_author = "qiaoba"
     author_url = "https://github.com/ruins-qiao/MoviePilot-Plugins"
     plugin_config_prefix = "u115rapidtransfer_"
@@ -307,171 +473,215 @@ class U115RapidTransfer(_PluginBase):
             }
         ]
 
+    @staticmethod
+    def _form_group_card(
+        title: str,
+        icon: str,
+        cols: list[dict[str, Any]],
+        *,
+        margin_class: str = "mb-4",
+    ) -> dict[str, Any]:
+        """构造配置表单的分组卡片，减少平铺堆叠造成的视觉拥挤。"""
+        return {
+            "component": "VCard",
+            "props": {"variant": "outlined", "class": margin_class},
+            "content": [
+                {
+                    "component": "VCardTitle",
+                    "props": {"class": "d-flex align-center ga-2 text-subtitle-1 py-3 px-4"},
+                    "content": [
+                        {
+                            "component": "VIcon",
+                            "props": {"icon": icon, "size": 18, "color": "primary"},
+                        },
+                        {"component": "span", "text": title},
+                    ],
+                },
+                {"component": "VDivider"},
+                {
+                    "component": "VCardText",
+                    "props": {"class": "pa-4"},
+                    "content": [{"component": "VRow", "content": cols}],
+                },
+            ],
+        }
+
     def get_form(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """返回插件配置表单与默认模型。"""
+        """返回按功能分组的插件配置表单与默认模型。"""
+        basic_cols = [
+            {
+                "component": "VCol",
+                "props": {"cols": 12, "md": 4},
+                "content": [
+                    {
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "enabled",
+                            "label": "启用插件",
+                        },
+                    }
+                ],
+            },
+            {
+                "component": "VCol",
+                "props": {"cols": 12, "md": 4},
+                "content": [
+                    {
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "notify",
+                            "label": "发送通知",
+                        },
+                    }
+                ],
+            },
+            {
+                "component": "VCol",
+                "props": {"cols": 12, "md": 4},
+                "content": [
+                    {
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "onlyonce",
+                            "label": "立即巡检一次",
+                        },
+                    }
+                ],
+            },
+        ]
+
+        filter_cols = [
+            {
+                "component": "VCol",
+                "props": {"cols": 12, "md": 6},
+                "content": [
+                    {
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "only_media",
+                            "label": "仅对媒体文件限制只秒传",
+                            "hint": "字幕、NFO、图片等附属文件仍允许普通上传",
+                            "persistent-hint": True,
+                        },
+                    }
+                ],
+            },
+            {
+                "component": "VCol",
+                "props": {"cols": 12, "md": 6},
+                "content": [
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "min_size_mb",
+                            "label": "最小限制文件大小",
+                            "type": "number",
+                            "placeholder": "0",
+                            "suffix": "MB",
+                            "hint": "小于该体积放行普通上传，0 表示不限制",
+                            "persistent-hint": True,
+                        },
+                    }
+                ],
+            },
+        ]
+
+        retry_cols = [
+            {
+                "component": "VCol",
+                "props": {"cols": 12, "md": 4},
+                "content": [
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "retry_delay",
+                            "label": "失败重试等待时间",
+                            "type": "number",
+                            "placeholder": "600",
+                            "suffix": "秒",
+                            "hint": "最小 10 秒（600 秒 = 10 分钟）",
+                            "persistent-hint": True,
+                        },
+                    }
+                ],
+            },
+            {
+                "component": "VCol",
+                "props": {"cols": 12, "md": 4},
+                "content": [
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "max_retries",
+                            "label": "最大自动重试次数",
+                            "type": "number",
+                            "placeholder": "5",
+                            "suffix": "次",
+                            "hint": "设为 0 仅阻止普通上传，不自动重试",
+                            "persistent-hint": True,
+                        },
+                    }
+                ],
+            },
+            {
+                "component": "VCol",
+                "props": {"cols": 12, "md": 4},
+                "content": [
+                    {
+                        "component": "VCronField",
+                        "props": {
+                            "model": "cron",
+                            "label": "兜底巡检周期",
+                            "placeholder": _DEFAULT_CRON,
+                            "hint": "定期检查因重启或错过定时而到期的任务",
+                            "persistent-hint": True,
+                        },
+                    }
+                ],
+            },
+        ]
+
+        help_panel = {
+            "component": "VExpansionPanels",
+            "props": {"variant": "accordion"},
+            "content": [
+                {
+                    "component": "VExpansionPanel",
+                    "props": {
+                        "title": "工作原理与远程命令说明",
+                    },
+                    "content": [
+                        {
+                            "component": "VExpansionPanelText",
+                            "content": [
+                                {
+                                    "component": "VAlert",
+                                    "props": {
+                                        "type": "info",
+                                        "variant": "tonal",
+                                        "density": "compact",
+                                        "text": (
+                                            "整理目标为 115 网盘（u115）时，仅调用秒传校验；"
+                                            "未命中则立即中止慢速分片上传，并按设定等待时间自动重试整理。"
+                                            "除详情页一键重试外，也可通过远程命令 /u115_rapid_retry 触发全量重试。"
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+
         return [
             {
                 "component": "VForm",
                 "content": [
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": "enabled",
-                                            "label": "启用插件",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": "notify",
-                                            "label": "发送通知",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": "onlyonce",
-                                            "label": "立即巡检一次",
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": "only_media",
-                                            "label": "仅对媒体文件限制只秒传",
-                                            "hint": "开启后字幕、NFO、图片等附属文件允许普通上传，仅音视频文件强制只秒传",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "min_size_mb",
-                                            "label": "最小限制文件大小（MB）",
-                                            "type": "number",
-                                            "placeholder": "0",
-                                            "hint": "小于该大小的文件允许普通上传，0 表示不按体积放行",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "retry_delay",
-                                            "label": "失败重试等待时间（秒）",
-                                            "type": "number",
-                                            "placeholder": "600",
-                                            "hint": "秒传失败后等待多少秒再重试（最小 10 秒，例如 600 = 10 分钟）",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "max_retries",
-                                            "label": "最大自动重试次数",
-                                            "type": "number",
-                                            "placeholder": "5",
-                                            "hint": "设为 0 表示仅阻止普通上传，不自动重试",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VCronField",
-                                        "props": {
-                                            "model": "cron",
-                                            "label": "兜底巡检周期",
-                                            "placeholder": _DEFAULT_CRON,
-                                            "hint": "定期检查因重启或错过定时而到期的待重试任务",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VAlert",
-                                        "props": {
-                                            "type": "info",
-                                            "variant": "tonal",
-                                            "text": (
-                                                "工作原理：当文件整理目标存储为 115 网盘（u115）时，插件仅调用 115 秒传初始化校验；"
-                                                "若秒传未命中，将直接中止本次上传（不会触发慢速 OSS 分片上传），"
-                                                "并在整理失败后按设定等待时间自动触发重新整理。可使用命令 /u115_rapid_retry 立即重试。"
-                                            ),
-                                        },
-                                    }
-                                ],
-                            }
-                        ],
-                    },
+                    self._form_group_card("基础控制", "mdi-tune-variant", basic_cols),
+                    self._form_group_card("拦截范围", "mdi-filter-outline", filter_cols),
+                    self._form_group_card("重试与巡检策略", "mdi-timer-cog-outline", retry_cols),
+                    help_panel,
                 ],
             }
         ], {
@@ -486,66 +696,391 @@ class U115RapidTransfer(_PluginBase):
         }
 
     def get_page(self) -> list[dict[str, Any]]:
-        """返回插件详情页，展示待重试队列、交互操作按钮与最近秒传记录。"""
+        """返回层次清晰的插件详情页，展示运行概览、待重试队列与最近记录。"""
         pending = self._load_pending_retries()
         records = self._load_records()
         stats = self._load_stats()
         plugin_id = self.__class__.__name__
+        now = time.time()
 
-        summary_text = (
-            f"状态：{'运行中' if self._enabled else '已停用'} | "
-            f"等待重试：{len(pending)} 项 | "
-            f"秒传成功：{stats.get('rapid_success', 0)} | "
-            f"拦截普通上传：{stats.get('rapid_blocked', 0)} | "
-            f"重试耗尽：{stats.get('retry_exhausted', 0)} | "
-            f"最近巡检：{_format_ts(self._last_scan_at)}"
+        strategy_parts = [
+            "仅媒体文件" if self._only_media else "全部文件",
+            f"重试间隔 {_format_duration(self._retry_delay)}",
+            f"上限 {self._max_retries} 次" if self._max_retries > 0 else "仅拦截不重试",
+        ]
+        if self._min_size_mb > 0:
+            strategy_parts.insert(1, f"≥{self._min_size_mb} MB")
+        status_desc = (
+            " · ".join(strategy_parts)
+            if self._enabled
+            else "插件当前已停用，未接管 115 网盘上传"
+        )
+        scan_text = (
+            f"最近巡检：{_format_compact_ts(self._last_scan_at, now)}"
+            if self._last_scan_at
+            else "最近巡检：尚未巡检"
         )
 
-        contents: list[dict[str, Any]] = [
-            {
-                "component": "VAlert",
-                "props": {
-                    "type": "success" if self._enabled else "warning",
-                    "variant": "tonal",
-                    "text": summary_text,
-                    "class": "mb-4",
-                },
+        status_strip = {
+            "component": "VCard",
+            "props": {
+                "variant": "tonal",
+                "color": "success" if self._enabled else "warning",
+                "class": "mb-4",
             },
+            "content": [
+                {
+                    "component": "VCardText",
+                    "props": {
+                        "class": "py-3 px-4 d-flex align-center justify-space-between flex-wrap ga-2"
+                    },
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {"class": "d-flex align-center flex-wrap ga-3"},
+                            "content": [
+                                {
+                                    "component": "VChip",
+                                    "props": {
+                                        "color": "success" if self._enabled else "warning",
+                                        "variant": "flat",
+                                        "size": "small",
+                                        "prepend-icon": (
+                                            "mdi-play-circle-outline"
+                                            if self._enabled
+                                            else "mdi-pause-circle-outline"
+                                        ),
+                                    },
+                                    "text": "运行中" if self._enabled else "已停用",
+                                },
+                                {
+                                    "component": "span",
+                                    "props": {"class": "text-body-2"},
+                                    "text": status_desc,
+                                },
+                            ],
+                        },
+                        {
+                            "component": "span",
+                            "props": {"class": "text-caption text-medium-emphasis"},
+                            "text": scan_text,
+                        },
+                    ],
+                }
+            ],
+        }
+
+        kpi_row = {
+            "component": "VRow",
+            "props": {"class": "mb-2"},
+            "content": [
+                _build_kpi_card(
+                    "待重试任务",
+                    len(pending),
+                    "项",
+                    "warning" if pending else "default",
+                    "mdi-timer-sand",
+                ),
+                _build_kpi_card(
+                    "累计秒传成功",
+                    stats.get("rapid_success", 0),
+                    "次",
+                    "success",
+                    "mdi-check-circle-outline",
+                ),
+                _build_kpi_card(
+                    "拦截普通上传",
+                    stats.get("rapid_blocked", 0),
+                    "次",
+                    "info",
+                    "mdi-shield-check-outline",
+                ),
+                _build_kpi_card(
+                    "重试耗尽",
+                    stats.get("retry_exhausted", 0),
+                    "次",
+                    "error" if stats.get("retry_exhausted", 0) else "default",
+                    "mdi-alert-circle-outline",
+                ),
+            ],
+        }
+
+        pending_rows = []
+        for item in sorted(pending.values(), key=lambda x: x.get("next_retry_at", 0)):
+            src_path = str(item.get("src_path") or "")
+            attempt = int(item.get("attempt", 0))
+            max_retries = int(item.get("max_retries", self._max_retries) or self._max_retries)
+            progress_color = "warning" if max_retries > 0 and attempt >= max_retries else "info"
+            rel_text, clock_text = _format_relative_retry(item.get("next_retry_at"), now)
+            pending_rows.append(
+                {
+                    "component": "tr",
+                    "content": [
+                        {
+                            "component": "td",
+                            "props": {"class": "py-3"},
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "props": {
+                                        "class": "font-weight-medium text-body-2 text-truncate",
+                                        "style": "max-width: 420px;",
+                                    },
+                                    "text": Path(src_path).name or "-",
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-caption text-medium-emphasis mt-1"},
+                                    "text": f"原因：{item.get('last_error') or '-'}",
+                                },
+                            ],
+                        },
+                        {
+                            "component": "td",
+                            "props": {"class": "py-3"},
+                            "content": [
+                                {
+                                    "component": "VChip",
+                                    "props": {
+                                        "color": progress_color,
+                                        "variant": "tonal",
+                                        "size": "small",
+                                    },
+                                    "text": f"{attempt} / {max_retries}",
+                                }
+                            ],
+                        },
+                        {
+                            "component": "td",
+                            "props": {"class": "py-3"},
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-body-2 font-weight-medium"},
+                                    "text": rel_text,
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-caption text-medium-emphasis"},
+                                    "text": clock_text,
+                                },
+                            ],
+                        },
+                        {
+                            "component": "td",
+                            "props": {"class": "py-3 text-right"},
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "props": {"class": "d-flex justify-end ga-1"},
+                                    "content": [
+                                        {
+                                            "component": "VBtn",
+                                            "props": {
+                                                "color": "primary",
+                                                "variant": "text",
+                                                "size": "small",
+                                                "disabled": not self._enabled or not src_path,
+                                            },
+                                            "text": "重试",
+                                            "events": {
+                                                "click": {
+                                                    "api": f"plugin/{plugin_id}/retry",
+                                                    "method": "post",
+                                                    "params": {"src_path": src_path},
+                                                }
+                                            },
+                                        },
+                                        {
+                                            "component": "VBtn",
+                                            "props": {
+                                                "color": "error",
+                                                "variant": "text",
+                                                "size": "small",
+                                                "disabled": not src_path,
+                                            },
+                                            "text": "移除",
+                                            "events": {
+                                                "click": {
+                                                    "api": f"plugin/{plugin_id}/clear",
+                                                    "method": "post",
+                                                    "params": {"src_path": src_path},
+                                                }
+                                            },
+                                        },
+                                    ],
+                                }
+                            ],
+                        },
+                    ],
+                }
+            )
+
+        pending_card_content: list[dict[str, Any]] = [
             {
-                "component": "div",
-                "props": {"class": "d-flex flex-wrap ga-2 mb-4"},
+                "component": "VCardTitle",
+                "props": {"class": "d-flex align-center justify-space-between flex-wrap ga-2 py-3 px-4"},
                 "content": [
                     {
-                        "component": "VBtn",
-                        "props": {
-                            "color": "primary",
-                            "variant": "tonal",
-                            "size": "small",
-                            "disabled": not (self._enabled and pending),
-                        },
-                        "text": "立即全部重试",
-                        "events": {
-                            "click": {
-                                "api": f"plugin/{plugin_id}/retry",
-                                "method": "post",
-                            }
-                        },
+                        "component": "div",
+                        "props": {"class": "d-flex align-center ga-2"},
+                        "content": [
+                            {"component": "span", "props": {"class": "text-subtitle-1 font-weight-medium"}, "text": "等待延迟重试队列"},
+                            {
+                                "component": "VChip",
+                                "props": {
+                                    "size": "x-small",
+                                    "variant": "tonal",
+                                    "color": "warning" if pending else "default",
+                                },
+                                "text": f"{len(pending)} 项",
+                            },
+                        ],
                     },
                     {
-                        "component": "VBtn",
-                        "props": {
-                            "color": "error",
-                            "variant": "tonal",
-                            "size": "small",
-                            "disabled": not pending,
+                        "component": "div",
+                        "props": {"class": "d-flex align-center ga-2"},
+                        "content": [
+                            {
+                                "component": "VBtn",
+                                "props": {
+                                    "color": "primary",
+                                    "variant": "tonal",
+                                    "size": "small",
+                                    "prepend-icon": "mdi-refresh",
+                                    "disabled": not (self._enabled and pending),
+                                },
+                                "text": "立即全部重试",
+                                "events": {
+                                    "click": {
+                                        "api": f"plugin/{plugin_id}/retry",
+                                        "method": "post",
+                                    }
+                                },
+                            },
+                            {
+                                "component": "VBtn",
+                                "props": {
+                                    "color": "error",
+                                    "variant": "text",
+                                    "size": "small",
+                                    "disabled": not pending,
+                                },
+                                "text": "清空队列",
+                                "events": {
+                                    "click": {
+                                        "api": f"plugin/{plugin_id}/clear",
+                                        "method": "post",
+                                    }
+                                },
+                            },
+                        ],
+                    },
+                ],
+            },
+            {"component": "VDivider"},
+        ]
+        if pending_rows:
+            pending_card_content.append(
+                {
+                    "component": "VTable",
+                    "content": [
+                        {
+                            "component": "thead",
+                            "content": [
+                                {
+                                    "component": "tr",
+                                    "content": [
+                                        {"component": "th", "text": "文件与拦截原因"},
+                                        {"component": "th", "text": "进度"},
+                                        {"component": "th", "text": "下次重试"},
+                                        {"component": "th", "props": {"class": "text-right"}, "text": "操作"},
+                                    ],
+                                }
+                            ],
                         },
-                        "text": "清空等待队列",
-                        "events": {
-                            "click": {
-                                "api": f"plugin/{plugin_id}/clear",
-                                "method": "post",
-                            }
+                        {"component": "tbody", "content": pending_rows},
+                    ],
+                }
+            )
+        else:
+            pending_card_content.append(
+                _build_empty_state("mdi-check-circle-outline", "当前队列空闲，暂无等待重试的 115 秒传任务")
+            )
+
+        visible_records = records[:_MAX_PAGE_RECORDS]
+        record_rows = []
+        for rec in visible_records:
+            status_text = str(rec.get("status") or "-")
+            status_color = _RECORD_STATUS_COLORS.get(status_text, "default")
+            record_rows.append(
+                {
+                    "component": "tr",
+                    "content": [
+                        {
+                            "component": "td",
+                            "props": {"class": "py-3"},
+                            "content": [
+                                {
+                                    "component": "VChip",
+                                    "props": {
+                                        "color": status_color,
+                                        "variant": "tonal",
+                                        "size": "small",
+                                    },
+                                    "text": status_text,
+                                }
+                            ],
                         },
+                        {
+                            "component": "td",
+                            "props": {"class": "py-3"},
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "props": {
+                                        "class": "font-weight-medium text-body-2 text-truncate",
+                                        "style": "max-width: 480px;",
+                                    },
+                                    "text": Path(rec.get("src_path", "")).name or "-",
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-caption text-medium-emphasis mt-1"},
+                                    "text": _format_record_detail(str(rec.get("message") or "-")),
+                                },
+                            ],
+                        },
+                        {
+                            "component": "td",
+                            "props": {"class": "py-3 text-right text-body-2 text-medium-emphasis"},
+                            "text": _format_compact_ts(rec.get("time"), now),
+                        },
+                    ],
+                }
+            )
+
+        record_subtitle = (
+            f"展示最近 {len(visible_records)} 条（共 {len(records)} 条）"
+            if records
+            else "暂无记录"
+        )
+        records_card_content: list[dict[str, Any]] = [
+            {
+                "component": "VCardTitle",
+                "props": {"class": "d-flex align-center justify-space-between flex-wrap ga-2 py-3 px-4"},
+                "content": [
+                    {
+                        "component": "div",
+                        "props": {"class": "d-flex align-center ga-2"},
+                        "content": [
+                            {"component": "span", "props": {"class": "text-subtitle-1 font-weight-medium"}, "text": "最近处理记录"},
+                            {
+                                "component": "span",
+                                "props": {"class": "text-caption text-medium-emphasis"},
+                                "text": record_subtitle,
+                            },
+                        ],
                     },
                     {
                         "component": "VBtn",
@@ -565,160 +1100,49 @@ class U115RapidTransfer(_PluginBase):
                     },
                 ],
             },
+            {"component": "VDivider"},
         ]
-
-        if pending:
-            pending_rows = []
-            for item in sorted(pending.values(), key=lambda x: x.get("next_retry_at", 0)):
-                src_path = str(item.get("src_path") or "")
-                pending_rows.append(
-                    {
-                        "component": "tr",
-                        "content": [
-                            {"component": "td", "text": Path(src_path).name or "-"},
-                            {
-                                "component": "td",
-                                "text": f"{item.get('attempt', 0)} / {item.get('max_retries', self._max_retries)}",
-                            },
-                            {"component": "td", "text": _format_ts(item.get("next_retry_at"))},
-                            {"component": "td", "text": str(item.get("last_error") or "-")},
-                            {
-                                "component": "td",
-                                "content": [
-                                    {
-                                        "component": "div",
-                                        "props": {"class": "d-flex ga-2"},
-                                        "content": [
-                                            {
-                                                "component": "VBtn",
-                                                "props": {
-                                                    "color": "primary",
-                                                    "variant": "text",
-                                                    "size": "x-small",
-                                                    "disabled": not self._enabled or not src_path,
-                                                },
-                                                "text": "重试",
-                                                "events": {
-                                                    "click": {
-                                                        "api": f"plugin/{plugin_id}/retry",
-                                                        "method": "post",
-                                                        "params": {"src_path": src_path},
-                                                    }
-                                                },
-                                            },
-                                            {
-                                                "component": "VBtn",
-                                                "props": {
-                                                    "color": "error",
-                                                    "variant": "text",
-                                                    "size": "x-small",
-                                                    "disabled": not src_path,
-                                                },
-                                                "text": "移除",
-                                                "events": {
-                                                    "click": {
-                                                        "api": f"plugin/{plugin_id}/clear",
-                                                        "method": "post",
-                                                        "params": {"src_path": src_path},
-                                                    }
-                                                },
-                                            },
-                                        ],
-                                    }
-                                ],
-                            },
-                        ],
-                    }
-                )
-            contents.append(
+        if record_rows:
+            records_card_content.append(
                 {
-                    "component": "VCard",
-                    "props": {"variant": "outlined", "class": "mb-4"},
+                    "component": "VTable",
                     "content": [
-                        {"component": "VCardTitle", "text": "等待延迟重试队列"},
                         {
-                            "component": "VTable",
-                            "props": {"density": "compact"},
+                            "component": "thead",
                             "content": [
                                 {
-                                    "component": "thead",
+                                    "component": "tr",
                                     "content": [
-                                        {
-                                            "component": "tr",
-                                            "content": [
-                                                {"component": "th", "text": "文件名"},
-                                                {"component": "th", "text": "重试进度"},
-                                                {"component": "th", "text": "下次重试时间"},
-                                                {"component": "th", "text": "拦截原因"},
-                                                {"component": "th", "text": "操作"},
-                                            ],
-                                        }
+                                        {"component": "th", "text": "结果"},
+                                        {"component": "th", "text": "文件与详情"},
+                                        {"component": "th", "props": {"class": "text-right"}, "text": "时间"},
                                     ],
-                                },
-                                {"component": "tbody", "content": pending_rows},
+                                }
                             ],
                         },
+                        {"component": "tbody", "content": record_rows},
                     ],
                 }
             )
         else:
-            contents.append(
-                {
-                    "component": "VAlert",
-                    "props": {
-                        "type": "info",
-                        "variant": "tonal",
-                        "text": "当前没有等待重试的 115 秒传任务。",
-                        "class": "mb-4",
-                    },
-                }
+            records_card_content.append(
+                _build_empty_state("mdi-history", "暂无秒传或重试处理记录")
             )
 
-        if records:
-            record_rows = [
-                {
-                    "component": "tr",
-                    "content": [
-                        {"component": "td", "text": _format_ts(rec.get("time"))},
-                        {"component": "td", "text": Path(rec.get("src_path", "")).name or "-"},
-                        {"component": "td", "text": str(rec.get("status") or "-")},
-                        {"component": "td", "text": str(rec.get("message") or "-")},
-                    ],
-                }
-                for rec in records[:20]
-            ]
-            contents.append(
-                {
-                    "component": "VCard",
-                    "props": {"variant": "outlined"},
-                    "content": [
-                        {"component": "VCardTitle", "text": "最近处理记录"},
-                        {
-                            "component": "VTable",
-                            "props": {"density": "compact"},
-                            "content": [
-                                {
-                                    "component": "thead",
-                                    "content": [
-                                        {
-                                            "component": "tr",
-                                            "content": [
-                                                {"component": "th", "text": "时间"},
-                                                {"component": "th", "text": "文件名"},
-                                                {"component": "th", "text": "结果"},
-                                                {"component": "th", "text": "详情"},
-                                            ],
-                                        }
-                                    ],
-                                },
-                                {"component": "tbody", "content": record_rows},
-                            ],
-                        },
-                    ],
-                }
-            )
-
-        return contents
+        return [
+            status_strip,
+            kpi_row,
+            {
+                "component": "VCard",
+                "props": {"variant": "outlined", "class": "mb-4"},
+                "content": pending_card_content,
+            },
+            {
+                "component": "VCard",
+                "props": {"variant": "outlined"},
+                "content": records_card_content,
+            },
+        ]
 
     def stop_service(self) -> None:
         """停用插件并清理定时调度与内存状态。"""
@@ -930,8 +1354,15 @@ class U115RapidTransfer(_PluginBase):
         if self._max_retries == 0:
             self._append_record(norm_path, "已拦截", f"{reason}（已关闭自动重试）")
             self._send_notice(
-                "【115秒传助手】已阻止普通上传",
-                f"文件：{media_title}\n路径：{norm_path}\n原因：{reason}\n未开启自动重试（最大重试次数为 0）。",
+                "🛡️ 115秒传助手 · 已拦截普通上传",
+                _format_notice_body(
+                    [
+                        ("📄 文件", str(media_title)),
+                        ("📂 路径", _shorten_path(norm_path)),
+                        ("⚠️ 原因", str(reason)),
+                        ("ℹ️ 说明", "最大重试次数为 0，已跳过普通上传且未安排自动重试"),
+                    ]
+                ),
             )
             return
 
@@ -951,8 +1382,15 @@ class U115RapidTransfer(_PluginBase):
                 f"【115秒传助手】{Path(norm_path).name} 已达到最大重试次数 {self._max_retries}，停止重试"
             )
             self._send_notice(
-                "【115秒传助手】达到最大重试次数",
-                f"文件：{media_title}\n路径：{norm_path}\n已重试 {self._max_retries} 次仍未秒传成功，已停止自动重试。",
+                "❌ 115秒传助手 · 重试已达上限",
+                _format_notice_body(
+                    [
+                        ("📄 文件", str(media_title)),
+                        ("📂 路径", _shorten_path(norm_path)),
+                        ("⚠️ 原因", str(reason)),
+                        ("🛑 状态", f"已重试 {self._max_retries} 次仍未秒传成功，已停止自动重试"),
+                    ]
+                ),
             )
             return
 
@@ -993,9 +1431,21 @@ class U115RapidTransfer(_PluginBase):
             f"{next_attempt}/{self._max_retries} 次重试"
         )
         if next_attempt == 1:
+            retry_clock = datetime.fromtimestamp(next_retry_at).strftime("%H:%M:%S")
             self._send_notice(
-                "【115秒传助手】已安排延迟重试",
-                f"文件：{media_title}\n原因：{reason}\n将在 {self._retry_delay} 秒后进行第 {next_attempt}/{self._max_retries} 次重试。",
+                "⏳ 115秒传助手 · 已安排延迟重试",
+                _format_notice_body(
+                    [
+                        ("📄 文件", str(media_title)),
+                        ("📂 路径", _shorten_path(norm_path)),
+                        ("⚠️ 原因", str(reason)),
+                        (
+                            "⏱ 计划",
+                            f"{_format_duration(self._retry_delay)}后进行第 {next_attempt}/{self._max_retries} 次重试（约 {retry_clock}）",
+                        ),
+                    ],
+                    tip="💡 可在插件详情页点击重试，或发送 /u115_rapid_retry 立即重试",
+                ),
             )
 
     @eventmanager.register(EventType.TransferComplete)
@@ -1016,12 +1466,19 @@ class U115RapidTransfer(_PluginBase):
             if removed is not None:
                 self._save_pending_retries(pending)
         if removed is not None:
+            attempt = removed.get("attempt", 1)
+            title = str(removed.get("title") or Path(norm_path).name)
             logger.info(
-                f"【115秒传助手】{Path(norm_path).name} 重试秒传成功（第 {removed.get('attempt', 1)} 次），已移出待重试队列"
+                f"【115秒传助手】{Path(norm_path).name} 重试秒传成功（第 {attempt} 次），已移出待重试队列"
             )
             self._send_notice(
-                "【115秒传助手】重试秒传成功",
-                f"文件：{removed.get('title') or Path(norm_path).name}\n第 {removed.get('attempt', 1)} 次重试已成功完成整理。",
+                "✅ 115秒传助手 · 重试秒传成功",
+                _format_notice_body(
+                    [
+                        ("📄 文件", title),
+                        ("🎯 结果", f"第 {attempt} 次延迟重试已成功完成秒传整理"),
+                    ]
+                ),
             )
 
     @eventmanager.register(EventType.PluginAction)
@@ -1032,17 +1489,34 @@ class U115RapidTransfer(_PluginBase):
         event_data = event.event_data
         if _extract_attr_or_key(event_data, "action") != "u115_rapid_retry":
             return
+        total_pending = len(self._load_pending_retries())
         triggered = self.retry_all_pending()
         logger.info(f"【115秒传助手】收到远程命令，已触发 {triggered} 个待重试任务")
         channel = _extract_attr_or_key(event_data, "channel")
         source = _extract_attr_or_key(event_data, "source")
         userid = _extract_attr_or_key(event_data, "user")
+        if total_pending == 0:
+            reply_text = "✨ 当前等待队列为空，暂无需要重试的 115 秒传任务。"
+        elif triggered > 0:
+            reply_text = _format_notice_body(
+                [
+                    ("🚀 本次触发", f"已投递 {triggered} 个待重试任务"),
+                    ("⏳ 队列总量", f"共 {total_pending} 项，完成后将自动更新结果"),
+                ]
+            )
+        else:
+            reply_text = _format_notice_body(
+                [
+                    ("ℹ️ 执行结果", f"队列共 {total_pending} 项，本次实际投递 {triggered} 个"),
+                    ("💡 可能原因", "任务正在重试中，或历史记录缺失/已超限"),
+                ]
+            )
         self.post_message(
             channel=channel,
             source=source,
             userid=userid,
-            title="【115秒传助手】手动重试",
-            text=f"已触发 {triggered} 个待重试文件的整理重试。",
+            title="🔄 115秒传助手 · 手动重试",
+            text=reply_text,
         )
 
     def _reschedule_persisted_retries(self) -> int:
