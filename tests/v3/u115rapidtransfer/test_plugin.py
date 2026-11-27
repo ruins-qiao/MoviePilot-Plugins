@@ -405,11 +405,29 @@ def test_beautified_ui_layout_and_notifications(plugin, tmp_path):
             "秒传成功",
             f"目标：/Media/Movies/FolderA/FolderB/Movie.{idx}.mkv",
         )
-    page_text = str(plugin.get_page())
+    page = plugin.get_page()
+    page_text = str(page)
     assert "待重试任务" in page_text
     assert "累计秒传成功" in page_text
     assert "展示最近 10 条（共 12 条）" in page_text
     assert ".../FolderA/FolderB/Movie.11.mkv" in page_text
+
+    def _collect_vicons(nodes):
+        found = []
+        if isinstance(nodes, list):
+            for node in nodes:
+                found.extend(_collect_vicons(node))
+        elif isinstance(nodes, dict):
+            if nodes.get("component") == "VIcon":
+                found.append(nodes)
+            found.extend(_collect_vicons(nodes.get("content", [])))
+        return found
+
+    vicons = _collect_vicons(form) + _collect_vicons(page)
+    assert vicons
+    for vicon in vicons:
+        assert str(vicon.get("text", "")).startswith("mdi-")
+        assert "icon" not in vicon.get("props", {})
 
     plugin.on_plugin_action(
         SimpleNamespace(

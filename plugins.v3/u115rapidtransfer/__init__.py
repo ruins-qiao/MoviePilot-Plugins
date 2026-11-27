@@ -200,7 +200,8 @@ def _build_kpi_card(
                                 "content": [
                                     {
                                         "component": "VIcon",
-                                        "props": {"icon": icon, "size": 20},
+                                        "props": {"size": 20},
+                                        "text": icon,
                                     }
                                 ],
                             },
@@ -220,7 +221,8 @@ def _build_empty_state(icon: str, text: str) -> dict[str, Any]:
         "content": [
             {
                 "component": "VIcon",
-                "props": {"icon": icon, "size": 28, "class": "mb-2 opacity-70"},
+                "props": {"size": 28, "class": "mb-2 opacity-70"},
+                "text": icon,
             },
             {
                 "component": "div",
@@ -492,7 +494,8 @@ class U115RapidTransfer(_PluginBase):
                     "content": [
                         {
                             "component": "VIcon",
-                            "props": {"icon": icon, "size": 18, "color": "primary"},
+                            "props": {"size": 18, "color": "primary"},
+                            "text": icon,
                         },
                         {"component": "span", "text": title},
                     ],
